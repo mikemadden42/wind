@@ -2,21 +2,20 @@ package main
 
 import (
 	"bytes"
-	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 )
 
-func createTempDirWithFiles(t *testing.T, files map[string]int64) string {
+func createFiles(t *testing.T, dir string, files map[string]int64) {
 	t.Helper()
-	dir, err := os.MkdirTemp("", "testdir")
-	if err != nil {
-		t.Fatalf("Failed to create temp directory: %v", err)
-	}
-
 	for filename, size := range files {
 		filePath := filepath.Join(dir, filename)
+		if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
+			t.Fatalf("Failed to create parent directory: %v", err)
+		}
 		f, err := os.Create(filePath)
 		if err != nil {
 			t.Fatalf("Failed to create test file: %v", err)
@@ -24,104 +23,163 @@ func createTempDirWithFiles(t *testing.T, files map[string]int64) string {
 		if err := f.Truncate(size); err != nil {
 			t.Fatalf("Failed to set file size: %v", err)
 		}
-		f.Close()
+		if err := f.Close(); err != nil {
+			t.Fatalf("Failed to close test file: %v", err)
+		}
 	}
-	return dir
+}
+
+// makeUnreadable removes all permissions from dir for the rest of the test.
+func makeUnreadable(t *testing.T, dir string) {
+	t.Helper()
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("permissions cannot make a directory unreadable here")
+	}
+	if err := os.Chmod(dir, 0); err != nil {
+		t.Fatalf("Failed to chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
 }
 
 func TestDirSize(t *testing.T) {
-	files := map[string]int64{
-		"file1.txt": 1024,      // 1 KB
-		"file2.txt": 2048,      // 2 KB
-		"file3.txt": 1024 * 10, // 10 KB
-	}
-	dir := createTempDirWithFiles(t, files)
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
+	createFiles(t, dir, map[string]int64{
+		"file1.txt":           1024,      // 1 KB
+		"file2.txt":           2048,      // 2 KB
+		"nested/file3.txt":    1024 * 10, // 10 KB
+		"nested/deep/file4.x": 1,
+	})
 
-	size, err := dirSize(dir)
+	var errOut bytes.Buffer
+	size, err := dirSize(dir, &errOut)
 	if err != nil {
 		t.Fatalf("dirSize returned an error: %v", err)
 	}
 
-	expectedSize := int64(1024 + 2048 + 1024*10)
+	expectedSize := int64(1024 + 2048 + 1024*10 + 1)
 	if size != expectedSize {
 		t.Errorf("Expected size %d, got %d", expectedSize, size)
 	}
+	if errOut.Len() != 0 {
+		t.Errorf("Expected no errors, got %q", errOut.String())
+	}
 }
 
-func TestListDirectories(t *testing.T) {
-	dir := createTempDirWithFiles(t, map[string]int64{"file1.txt": 1024})
-	defer os.RemoveAll(dir)
+func TestDirSizeMissing(t *testing.T) {
+	var errOut bytes.Buffer
+	if _, err := dirSize(filepath.Join(t.TempDir(), "missing"), &errOut); err == nil {
+		t.Error("Expected an error for a missing directory")
+	}
+}
 
-	// Create subdirectories
-	subDir1 := filepath.Join(dir, "subdir1")
-	subDir2 := filepath.Join(dir, "subdir2")
-	os.Mkdir(subDir1, 0755)
-	os.Mkdir(subDir2, 0755)
+func TestDirSizeUnreadableRoot(t *testing.T) {
+	dir := t.TempDir()
+	makeUnreadable(t, dir)
 
-	entries, err := listDirectories(dir)
+	var errOut bytes.Buffer
+	if _, err := dirSize(dir, &errOut); err == nil {
+		t.Error("Expected an error for an unreadable directory")
+	}
+}
+
+func TestDirSizeUnreadableChild(t *testing.T) {
+	dir := t.TempDir()
+	createFiles(t, dir, map[string]int64{"file1.txt": 100, "locked/file2.txt": 200})
+	makeUnreadable(t, filepath.Join(dir, "locked"))
+
+	var errOut bytes.Buffer
+	size, err := dirSize(dir, &errOut)
 	if err != nil {
-		t.Fatalf("listDirectories returned an error: %v", err)
+		t.Fatalf("dirSize returned an error: %v", err)
 	}
-
-	var subDirNames []string
-	for _, entry := range entries {
-		if entry.IsDir() {
-			subDirNames = append(subDirNames, entry.Name())
-		}
+	if size != 100 {
+		t.Errorf("Expected size 100, got %d", size)
 	}
-
-	expectedDirs := []string{"subdir1", "subdir2"}
-	if len(subDirNames) != len(expectedDirs) {
-		t.Fatalf("Expected %d directories, got %d", len(expectedDirs), len(subDirNames))
-	}
-
-	for i, expected := range expectedDirs {
-		if subDirNames[i] != expected {
-			t.Errorf("Expected directory %s, got %s", expected, subDirNames[i])
-		}
+	if !strings.Contains(errOut.String(), "locked") {
+		t.Errorf("Expected an error mentioning the locked directory, got %q", errOut.String())
 	}
 }
 
 func TestPrintDirectorySize(t *testing.T) {
-	var buf bytes.Buffer
-
-	// Test for MB output
-	printDirectorySizeToWriter(&buf, "testdir", 10485760, "MB") // 10 MB
-	expected := "10\ttestdir\n"
-	if buf.String() != expected {
-		t.Errorf("Expected output %q, got %q", expected, buf.String())
+	tests := []struct {
+		size     int64
+		unit     string
+		expected string
+	}{
+		{10 * 1024 * 1024, "MB", "10\ttestdir\n"},
+		{10 * 1024, "KB", "10\ttestdir\n"},
+		{10, "B", "10\ttestdir\n"},
+		{1, "MB", "1\ttestdir\n"},
+		{1024 + 1, "KB", "2\ttestdir\n"},
+		{0, "MB", "0\ttestdir\n"},
 	}
-	buf.Reset()
-
-	// Test for KB output
-	printDirectorySizeToWriter(&buf, "testdir", 10240, "KB") // 10 KB
-	expected = "10\ttestdir\n"
-	if buf.String() != expected {
-		t.Errorf("Expected output %q, got %q", expected, buf.String())
-	}
-	buf.Reset()
-
-	// Test for Bytes output
-	printDirectorySizeToWriter(&buf, "testdir", 10, "B") // 10 bytes
-	expected = "10\ttestdir\n"
-	if buf.String() != expected {
-		t.Errorf("Expected output %q, got %q", expected, buf.String())
+	for _, tt := range tests {
+		var buf bytes.Buffer
+		printDirectorySize(&buf, "testdir", tt.size, unitSizes[tt.unit])
+		if buf.String() != tt.expected {
+			t.Errorf("size %d %s: expected %q, got %q", tt.size, tt.unit, tt.expected, buf.String())
+		}
 	}
 }
 
-// printDirectorySizeToWriter is a helper function that writes to an io.Writer for testing purposes
-func printDirectorySizeToWriter(w *bytes.Buffer, dir string, size int64, unit string) {
-	var sizeFormatted int64
-	switch unit {
-	case "B":
-		sizeFormatted = size
-	case "KB":
-		sizeFormatted = size / 1024
-	case "MB":
-		sizeFormatted = size / bytesInMB
-	default:
-		sizeFormatted = size / bytesInMB
+func TestRun(t *testing.T) {
+	dir := t.TempDir()
+	createFiles(t, dir, map[string]int64{
+		"top.txt":        5000, // Files at the top level are not reported
+		"a/file.txt":     2048,
+		"b/sub/file.txt": 1024,
+	})
+
+	var stdout, stderr bytes.Buffer
+	if status := run([]string{"-dir", dir, "-unit", "KB"}, &stdout, &stderr); status != 0 {
+		t.Fatalf("Expected status 0, got %d (stderr %q)", status, stderr.String())
 	}
-	fmt.Fprintf(w, "%d\t%s\n", sizeFormatted, dir)
+
+	expected := "2\ta\n1\tb\n"
+	if stdout.String() != expected {
+		t.Errorf("Expected output %q, got %q", expected, stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("Expected no errors, got %q", stderr.String())
+	}
+}
+
+func TestRunInvalidUnit(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if status := run([]string{"-dir", t.TempDir(), "-unit", "GB"}, &stdout, &stderr); status != 2 {
+		t.Errorf("Expected status 2, got %d", status)
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("Expected no output, got %q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "invalid unit") {
+		t.Errorf("Expected an invalid unit error, got %q", stderr.String())
+	}
+}
+
+func TestRunMissingDir(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if status := run([]string{"-dir", filepath.Join(t.TempDir(), "missing")}, &stdout, &stderr); status != 1 {
+		t.Errorf("Expected status 1, got %d", status)
+	}
+	if stderr.Len() == 0 {
+		t.Error("Expected an error message")
+	}
+}
+
+func TestRunUnreadableSubdir(t *testing.T) {
+	dir := t.TempDir()
+	createFiles(t, dir, map[string]int64{"ok/file.txt": 10, "locked/file.txt": 10})
+	makeUnreadable(t, filepath.Join(dir, "locked"))
+
+	var stdout, stderr bytes.Buffer
+	if status := run([]string{"-dir", dir, "-unit", "B"}, &stdout, &stderr); status != 1 {
+		t.Errorf("Expected status 1, got %d", status)
+	}
+	if stdout.String() != "10\tok\n" {
+		t.Errorf("Expected only the readable directory, got %q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "locked") {
+		t.Errorf("Expected an error mentioning the locked directory, got %q", stderr.String())
+	}
 }
