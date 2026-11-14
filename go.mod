@@ -1,3 +1,3 @@
-module wind
+module github.com/mikemadden42/wind
 
-go 1.23
+go 1.26

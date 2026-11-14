@@ -10,17 +10,29 @@ jobs:
   build:
     strategy:
       matrix:
-        go-version: [1.23.x, 1.24.x, 1.25.x]
+        go-version: [oldstable, stable]
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
     - name: Install Go
-      uses: actions/setup-go@v5
+      uses: actions/setup-go@v7
       with:
         go-version: ${{ matrix.go-version }}
-    - name: Checkout code
-      uses: actions/checkout@v4
     - name: Build
       run: go build -v ./...
     - name: Test
       run: go test -v ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+    - name: Install Go
+      uses: actions/setup-go@v7
+      with:
+        go-version: stable
+    - name: Lint
+      run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 run

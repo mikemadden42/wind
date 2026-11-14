@@ -1,69 +1,97 @@
+// Package main implements wind, a command-line tool that reports the total
+// size of each subdirectory of a directory.
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 )
 
-const bytesInMB = 1024 * 1024
+var unitSizes = map[string]int64{
+	"B":  1,
+	"KB": 1024,
+	"MB": 1024 * 1024,
+}
 
-func dirSize(path string) (int64, error) {
+// dirSize returns the total apparent size of the non-directory entries under
+// path. Entries below path that cannot be read are reported to errOut and
+// skipped; an error is returned only if path itself cannot be walked.
+func dirSize(path string, errOut io.Writer) (int64, error) {
 	var size int64
-	err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+	err := filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
-			fmt.Printf("Error accessing file: %v\n", err)
-			return nil // Continue to next file instead of returning error
+			if p == path {
+				return err
+			}
+			fmt.Fprintf(errOut, "wind: %v\n", err)
+			return nil // Continue with the rest of the tree
 		}
-		if !info.IsDir() {
-			size += info.Size()
+		if d.IsDir() {
+			return nil
 		}
+		info, err := d.Info()
+		if err != nil {
+			fmt.Fprintf(errOut, "wind: %v\n", err)
+			return nil
+		}
+		size += info.Size()
 		return nil
 	})
 	return size, err
 }
 
-func listDirectories(dir string) ([]os.DirEntry, error) {
-	return os.ReadDir(dir)
+// printDirectorySize writes size in units of unitSize, rounded up so that a
+// non-empty directory never reports 0, matching du.
+func printDirectorySize(w io.Writer, dir string, size, unitSize int64) {
+	fmt.Fprintf(w, "%d\t%s\n", (size+unitSize-1)/unitSize, dir)
 }
 
-func printDirectorySize(dir string, size int64, unit string) {
-	var sizeFormatted int64
-	switch unit {
-	case "B":
-		sizeFormatted = size
-	case "KB":
-		sizeFormatted = size / 1024
-	case "MB":
-		sizeFormatted = size / bytesInMB
-	default:
-		fmt.Println("Invalid unit; using MB as default")
-		sizeFormatted = size / bytesInMB
+func run(args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("wind", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	dir := flags.String("dir", ".", "Specify the directory to summarize disk usage for")
+	unit := flags.String("unit", "MB", "Output unit: B (bytes), KB, or MB")
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
 	}
-	fmt.Printf("%d\t%s\n", sizeFormatted, dir)
+
+	unitSize, ok := unitSizes[*unit]
+	if !ok {
+		fmt.Fprintf(stderr, "wind: invalid unit %q (want B, KB, or MB)\n", *unit)
+		return 2
+	}
+
+	entries, err := os.ReadDir(*dir)
+	if err != nil {
+		fmt.Fprintf(stderr, "wind: %v\n", err)
+		return 1
+	}
+
+	status := 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		subDirPath := filepath.Join(*dir, entry.Name())
+		size, err := dirSize(subDirPath, stderr)
+		if err != nil {
+			fmt.Fprintf(stderr, "wind: %v\n", err)
+			status = 1
+			continue
+		}
+		printDirectorySize(stdout, entry.Name(), size, unitSize)
+	}
+	return status
 }
 
 func main() {
-	dir := flag.String("dir", ".", "Specify the directory to summarize disk usage for")
-	unit := flag.String("unit", "MB", "Output unit: B (bytes), KB, or MB")
-	flag.Parse()
-
-	entries, err := listDirectories(*dir)
-	if err != nil {
-		fmt.Println("Error reading directory:", err)
-		os.Exit(1)
-	}
-
-	for _, entry := range entries {
-		if entry.IsDir() {
-			subDirPath := filepath.Join(*dir, entry.Name())
-			size, err := dirSize(subDirPath)
-			if err != nil {
-				fmt.Printf("Error calculating size for %s: %v\n", subDirPath, err)
-				continue
-			}
-			printDirectorySize(entry.Name(), size, *unit)
-		}
-	}
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
